@@ -72,7 +72,8 @@ class PeerApi(unittest.TestCase):
         posts = [c for c in calls if c[0] == "POST"]
         self.assertEqual(posts[0][1], f"/channels/{SUB}/messages")
         self.assertTrue(posts[0][2]["content"].startswith(f"<@{PEER}> "))
-        self.assertEqual(posts[0][2]["allowed_mentions"], {"users": [PEER]})
+        self.assertEqual(posts[0][2]["allowed_mentions"],
+                         {"users": ["111", PEER]})  # owners + peer only
         self.assertIn(("PATCH", f"/channels/{SUB}", {"archived": False}),
                       calls)  # archived thread revived
 
@@ -98,6 +99,19 @@ class PeerApi(unittest.TestCase):
         self.assertNotIn(SUB, json.load(open(mod.PEER_HOLDS_FILE)))
         _, err = run(mod, "peer-wait", "--to", SUB, "--until", "(")
         self.assertIn("not a regex", err)
+
+    def test_solo_thread_from_owner_message(self):
+        mod, calls = load()
+        out, err = run(mod, "peer-thread", "--from", "1300000000000000042",
+                       "--solo", "Your question", "Here's what I found.")
+        self.assertIsNone(err, out)
+        self.assertIn(("POST", f"/channels/{PARENT}/messages/"
+                       f"1300000000000000042/threads",
+                       {"name": "Your question",
+                        "auto_archive_duration": 10080}), calls)
+        post = [c for c in calls if c[1].endswith("/messages")][-1]
+        self.assertEqual(post[2]["content"], "Here's what I found.")
+        self.assertEqual(post[2]["allowed_mentions"], {"users": ["111"]})
 
 
 if __name__ == "__main__":

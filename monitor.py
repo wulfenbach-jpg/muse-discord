@@ -824,7 +824,8 @@ def discover_threads_iter(gid, gname, names_by_id, known_ids,
                     "guild_id": gid, "guild_name": gname,
                     "can_send": can_send,
                     "thread": True, "parent_id": t.get("parent_id"),
-                    "private": t.get("type") == 12}
+                    "private": t.get("type") == 12,
+                    "owner_id": t.get("owner_id")}  # bridge: who made it
         if tid not in previous and _snowflake_ts(tid) >= since:
             _NEW_THREADS.add(tid)
     return out
@@ -4142,6 +4143,10 @@ def trigger_verdict(msg, guild_id=None, state=None):
     if not owner and owners_absent(gid):
         return None, ("none of the owners is in this server"
                       if direct else None)
+    if owner and PEERS and str((CHANNELS.get(msg.get("channel_id")) or {})
+                               .get("owner_id")) == str(BOT_ID) \
+            and not addresses_someone_else(msg):
+        return "mention", None  # an owner in a thread the bot opened
     if peer_of(msg):  # a peer in its channels: addressed, unless held
         # A held message is ledgered skipped (the refusal), so the
         # sweep never requeues it after the hold ends; the next wake
@@ -8210,7 +8215,8 @@ def drain_gateway(state, inbox, channels):
                         "can_send": None,
                         "thread": ch.get("type") in _THREAD_TYPES,
                         "parent_id": ch.get("parent_id"),
-                        "private": ch.get("type") == 12}
+                        "private": ch.get("type") == 12,
+                        "owner_id": ch.get("owner_id")}
                 if not info["thread"] and ch.get("parent_id"):
                     CHANNEL_CATEGORY[cid] = ch["parent_id"]
                 if not info["thread"]:  # watches: who can read it

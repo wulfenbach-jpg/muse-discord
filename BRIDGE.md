@@ -11,6 +11,7 @@ owner can read along or jump into any thread.
 | Piece | Where | What |
 | --- | --- | --- |
 | Inbound | `monitor.py` `trigger_verdict` | Every message the peer writes in its channels, or any thread under them, wakes the worker: no @mention needed, even under `who.bots: ignore`. The item carries `peer: {name, owners}`. |
+| Own threads | `monitor.py` `trigger_verdict` | An owner's messages in a thread the bot opened wake it with no mention, like Hermes's threads (unless the message is addressed to someone else). Pinged in the peer's channel itself, the worker answers in a new thread on the owner's message. |
 | Holds | `monitor.py` `peer_held`, `peer_holds.json` | The worker can stay asleep in a thread until the peer's message matches a regex, or until some hours pass. Held messages are recorded as handled (the sweep never requeues them), and the next wake sees them in its history. Only the peer is held, never the owner. |
 | Outbound | `bin/discord-api.py peer-*` | `peer-thread` (new thread, first message), `peer-post`, `peer-read` and `peer-wait`, with no owner nonce, from the main chat or any run, only in the peer's channels and their threads. They @mention only the peer and un-archive threads when needed. |
 | Orders | `worker-prompt.template.md`, PEER AGENT | Chain of command: owner -> this bot -> peer, and peer -> this bot. What the owner tells this bot to have the peer do counts as the owner's say-so. |
@@ -34,6 +35,23 @@ $api peer-post --to 1571... --until '^DONE' "Now check refundable ones."
 $api peer-read --to 1571... 30      # the whole story, if needed
 $api peer-wait --to 1571... --off   # wake on everything again
 ```
+
+Pinged by the owner in the channel itself, the worker opens a thread on
+their message and answers there (`peer-thread --from <their message>
+--solo "<title>" "<answer>"`). They keep talking in it without
+mentions, and `peer-post --to <thread>` brings the peer in.
+
+## From the main chat
+
+The owner's Muse main chat (the native UI) is not the reply worker and
+never reads its prompt. It uses the same commands from the package dir:
+`peer-thread "<title>" "<task>"` to start a task with the peer (add
+`--solo` for a thread with just the owner), `peer-post --to <thread>`
+to continue, and `peer-read --to <thread>` to check on it. Anything
+posted in a thread the bot opened, by the peer or the owner, then wakes
+the reply worker, which carries the thread on. Put a line about this in
+the Muse's own notes or memory so the main chat knows the commands
+exist.
 
 ## Cost
 

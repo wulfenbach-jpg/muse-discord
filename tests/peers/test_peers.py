@@ -72,6 +72,17 @@ with contextlib.redirect_stdout(io.StringIO()):
     out["after_hold"] = m.classify_message(
         st, msg(sys.argv_peer, SUB, text="also, fyi"), "S #t", "G")
     out["ledger_has_hold"] = "peer hold" in open(m.LEDGER_FILE).read()
+    MINE, THEIRS = "1200000000000000010", "1200000000000000011"
+    for tid, owner in ((MINE, "999"), (THEIRS, sys.argv_peer)):
+        m.CHANNELS[tid] = {"name": "t", "guild_id": "G", "thread": True,
+                           "parent_id": sys.argv_thread, "owner_id": owner}
+    out["owner_in_my_thread"] = m.classify_message(
+        st, msg("111", MINE, bot=False, text="and also"), "S #t", "G")
+    out["owner_to_peer_in_my_thread"] = m.classify_message(
+        st, dict(msg("111", MINE, bot=False, text="do it"),
+                 mentions=[{"id": sys.argv_peer}]), "S #t", "G")
+    out["owner_in_other_thread"] = m.classify_message(
+        st, msg("111", THEIRS, bot=False, text="hm"), "S #t", "G")
 out["peers"] = [p["name"] for p in m.PEERS]
 print(json.dumps(out))
 """
@@ -119,6 +130,12 @@ class Peers(unittest.TestCase):
         self.assertEqual(r["held_done"], "mention")  # condition met
         self.assertEqual(r["after_hold"], "mention")  # hold ended
         self.assertTrue(r["ledger_has_hold"])      # sweep won't requeue
+
+    def test_owner_in_bot_threads(self):
+        r = run_probe(CFG)
+        self.assertEqual(r["owner_in_my_thread"], "mention")
+        self.assertIsNone(r["owner_to_peer_in_my_thread"])
+        self.assertIsNone(r["owner_in_other_thread"])
 
     def test_validate(self):
         self.assertEqual(validate(CFG).returncode, 0, validate(CFG).stdout)

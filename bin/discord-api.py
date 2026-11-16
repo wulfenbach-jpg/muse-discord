@@ -534,15 +534,16 @@ def _peer(args):
     peers = st.peers if st is not None else []
     if not peers:
         raise SystemExit("Refusing: no peers in config.yaml.")
-    opts, rest, i = {"to": None, "until": None, "hours": None,
-                     "off": False}, [], 0
+    opts, rest, i = {"to": None, "until": None, "hours": None, "from": None,
+                     "off": False, "solo": False}, [], 0
     while i < len(args):
         a = args[i]
-        if a in ("--to", "--until", "--hours") and i + 1 < len(args):
+        if a in ("--to", "--until", "--hours", "--from") \
+                and i + 1 < len(args):
             opts[a[2:]] = args[i + 1]
             i += 2
-        elif a == "--off":
-            opts["off"], i = True, i + 1
+        elif a in ("--off", "--solo"):
+            opts[a[2:]], i = True, i + 1
         else:
             rest.append(a)
             i += 1
@@ -607,16 +608,20 @@ def _hold(cid, opts):
     os.replace(tmp, PEER_HOLDS_FILE)
 
 
-def _say(peer, cid, text):
+def _say(peer, cid, text, solo=False):
+    """Post text in cid. It @mentions the peer unless solo; it may ping
+    the owners and the peer, never anyone else, roles or @everyone."""
     tag = f"<@{peer['user_id']}>"
     text = text.strip()
-    text = text if tag in text else f"{tag} {text}"
-    if len(text) > 2000:
+    if not solo and tag not in text:
+        text = f"{tag} {text}"
+    if not text or len(text) > 2000:
         raise SystemExit(f"Refusing: {len(text)} characters; Discord "
-                         f"takes 2000. Split it.")
+                         f"takes 1-2000. Split it.")
     scrub(text)
+    users = sorted(_owners() or set()) + ([] if solo else [peer["user_id"]])
     return api("POST", f"/channels/{cid}/messages", {
-        "content": text, "allowed_mentions": {"users": [peer["user_id"]]}})
+        "content": text, "allowed_mentions": {"users": users[:100]}})
 
 
 def cmd_peer_post(args):
@@ -631,9 +636,13 @@ def cmd_peer_post(args):
 
 
 def cmd_peer_thread(args):
-    """peer-thread [--to <peer channel id>] [--until REGEX] [--hours H]
-    <title> <text> -- open a new public thread in the peer's channel and
-    start it with text to the peer. Prints the thread id."""
+    """peer-thread [--to <peer channel id>] [--from <message id>]
+    [--solo] [--until REGEX] [--hours H] <title> <text> -- open a public
+    thread in the peer's channel (on --from, a message there, like a
+    reply thread) and post text in it. It @mentions the peer, unless
+    --solo (a thread with the owner only; bring the peer in later with
+    peer-post --to). The owners' messages in it wake you, no mention
+    needed. Prints the thread id."""
     peer, ch, opts, rest = _peer(args)
     if len(rest) < 2:
         raise SystemExit("usage: peer-thread [...] <title> <text>")
@@ -642,9 +651,13 @@ def cmd_peer_thread(args):
                          f"name the parent with --to.")
     title = rest[0].strip()[:100] or "task"
     scrub(title)
-    t = api("POST", f"/channels/{ch['id']}/threads", {
-        "name": title, "type": 11, "auto_archive_duration": 10080})
-    m = _say(peer, t["id"], " ".join(rest[1:]))
+    body = {"name": title, "auto_archive_duration": 10080}
+    if opts["from"]:
+        t = api("POST", f"/channels/{ch['id']}/messages/"
+                f"{snowflake(opts['from'])}/threads", body)
+    else:
+        t = api("POST", f"/channels/{ch['id']}/threads", dict(body, type=11))
+    m = _say(peer, t["id"], " ".join(rest[1:]), solo=opts["solo"])
     _hold(t["id"], opts)
     print(f"created thread {t['id']} '{title}', posted message {m['id']}")
 

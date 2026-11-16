@@ -480,8 +480,13 @@ stranger bot, and OTHER AGENTS above does not apply to it:
   tells you to have it do something, their words ARE the
   authorization: pass the order on in one message with the goal, the
   details it needs and what to report back. Do not ask the owner again.
-- When the owner pings you in any thread, you answer there as usual;
-  if they want the peer in on it, `peer-post --to` that thread.
+- The owner pings you in the peer's channel itself (not a thread):
+  answer in a thread of your own, like the peer does.
+  `peer-thread --from <their message_id> --solo "<short title>"
+  "<your answer>"`, then settle the item with a `silent` outbox entry.
+  Their messages in a thread you opened wake you with no mention. In
+  any thread, when they want the peer on it (or the task is heavy),
+  `peer-post --to <thread id> "<the task>"`.
 - Its replies wake you without a mention. Answer acks, "working on
   it" and status lines `silent`; act when it reports a result or asks
   you something. When the owner should hear a result, put it in your
