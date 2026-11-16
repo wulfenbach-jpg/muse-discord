@@ -519,56 +519,151 @@ def cmd_delete_own(args):
     print(f"deleted {mid}")
 
 
-# Bridge fork (BRIDGE.md): peer-post and peer-read act only in
-# a peer's own channels (config.yaml peers:), with no owner nonce, so the
-# main chat and any run can talk to the peer. Every other subcommand
-# keeps its nonce rule.
+# Bridge fork (BRIDGE.md): the peer-* subcommands act only in a peer's
+# channels and their threads (config.yaml peers:), with no owner nonce,
+# so the main chat and any run can talk to the peer. Every other
+# subcommand keeps its nonce rule.
+PEER_HOLDS_FILE = os.path.join(PACKAGE_DIR, "peer_holds.json")
+
+
 def _peer(args):
-    """(peer, channel_id, rest) from [--to <channel_id>] ARGS: the peer
-    whose channels hold --to, else the first peer's first channel."""
+    """(peer, channel, opts, rest) from [--to <id>] [--until REGEX]
+    [--hours H] [--off] ARGS. --to is a peer channel or a thread of one
+    (checked live); default: the first peer's first channel."""
     st = _settings()
     peers = st.peers if st is not None else []
-    to = None
-    if len(args) >= 2 and args[0] == "--to":
-        to, args = snowflake(args[1]), args[2:]
-    for p in peers:
-        if to is None or to in p["channels"]:
-            return p, to or p["channels"][0], args
-    raise SystemExit("Refusing: no peer in config.yaml has that channel.")
-
-
-def _open_peer_channel(cid):
-    """Refuse DMs; un-archive an archived (unlocked) thread first."""
+    if not peers:
+        raise SystemExit("Refusing: no peers in config.yaml.")
+    opts, rest, i = {"to": None, "until": None, "hours": None,
+                     "off": False}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--to", "--until", "--hours") and i + 1 < len(args):
+            opts[a[2:]] = args[i + 1]
+            i += 2
+        elif a == "--off":
+            opts["off"], i = True, i + 1
+        else:
+            rest.append(a)
+            i += 1
+    cid = snowflake(opts["to"]) if opts["to"] else peers[0]["channels"][0]
     ch = api("GET", f"/channels/{cid}")
     if ch.get("type") in DM_TYPES:
         raise SystemExit(f"Refusing: {cid} is a DM.")
+    parent = str(ch.get("parent_id") or "")
+    for p in peers:
+        if cid in p["channels"] or parent in p["channels"]:
+            return p, ch, opts, rest
+    raise SystemExit(f"Refusing: {cid} is not a peer channel or a thread "
+                     f"of one (config.yaml peers:).")
+
+
+def _wake_ok(ch):
+    """Un-archive an archived (unlocked) thread so the peer can answer."""
     meta = ch.get("thread_metadata") or {}
     if meta.get("archived") and not meta.get("locked"):
-        api("PATCH", f"/channels/{cid}", {"archived": False})
+        api("PATCH", f"/channels/{ch['id']}", {"archived": False})
 
 
-def cmd_peer_post(args):
-    """peer-post [--to <channel_id>] <text> -- message the peer agent in
-    its channel; @mentions the peer and nobody else."""
-    peer, cid, rest = _peer(args)
+def _hold(cid, opts):
+    """peer_holds.json: don't wake the worker for the peer's messages in
+    cid until one matches --until (case-insensitive regex) or --hours
+    pass (default 24, max 168); the owner and others are never held.
+    --off clears. Nothing to do without --until/--hours/--off."""
+    if not (opts["until"] or opts["hours"] or opts["off"]):
+        return
+    try:
+        with open(PEER_HOLDS_FILE) as f:
+            holds = json.load(f)
+        holds = holds if isinstance(holds, dict) else {}
+    except (OSError, ValueError):
+        holds = {}
+    import time
+    holds = {k: v for k, v in holds.items()
+             if isinstance(v, dict) and v.get("expires", 0) > time.time()}
+    if opts["off"]:
+        holds.pop(cid, None)
+        print(f"hold on {cid} cleared")
+    else:
+        until = opts["until"]
+        if until:
+            if len(until) > 200:
+                raise SystemExit("Refusing: --until is over 200 characters.")
+            try:
+                re.compile(until)
+            except re.error as e:
+                raise SystemExit(f"Refusing: --until is not a regex ({e}).")
+        try:
+            hours = min(max(float(opts["hours"] or 24), 0.01), 168)
+        except ValueError:
+            raise SystemExit("Refusing: --hours is not a number.")
+        holds[cid] = {"until": until, "expires": time.time() + hours * 3600}
+        why = f"a message matches {until!r} or " if until else ""
+        print(f"peer messages in {cid} won't wake you until {why}"
+              f"{hours:g}h pass")
+    tmp = f"{PEER_HOLDS_FILE}.{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(holds, f)
+    os.replace(tmp, PEER_HOLDS_FILE)
+
+
+def _say(peer, cid, text):
     tag = f"<@{peer['user_id']}>"
-    text = " ".join(rest).strip()
+    text = text.strip()
     text = text if tag in text else f"{tag} {text}"
     if len(text) > 2000:
         raise SystemExit(f"Refusing: {len(text)} characters; Discord "
                          f"takes 2000. Split it.")
     scrub(text)
-    _open_peer_channel(cid)
-    m = api("POST", f"/channels/{cid}/messages", {
-        "content": text,
-        "allowed_mentions": {"users": [peer["user_id"]]}})
-    print(f"posted message {m['id']} to {peer['name']}")
+    return api("POST", f"/channels/{cid}/messages", {
+        "content": text, "allowed_mentions": {"users": [peer["user_id"]]}})
+
+
+def cmd_peer_post(args):
+    """peer-post [--to <channel/thread id>] [--until REGEX] [--hours H]
+    <text> -- message the peer (@mentions it, nobody else). With
+    --until/--hours, its replies there wake you only once one matches."""
+    peer, ch, opts, rest = _peer(args)
+    _wake_ok(ch)
+    m = _say(peer, ch["id"], " ".join(rest))
+    _hold(ch["id"], opts)
+    print(f"posted message {m['id']} to {peer['name']} in {ch['id']}")
+
+
+def cmd_peer_thread(args):
+    """peer-thread [--to <peer channel id>] [--until REGEX] [--hours H]
+    <title> <text> -- open a new public thread in the peer's channel and
+    start it with text to the peer. Prints the thread id."""
+    peer, ch, opts, rest = _peer(args)
+    if len(rest) < 2:
+        raise SystemExit("usage: peer-thread [...] <title> <text>")
+    if ch.get("type") not in (0, 5):
+        raise SystemExit(f"Refusing: {ch['id']} is not a text channel; "
+                         f"name the parent with --to.")
+    title = rest[0].strip()[:100] or "task"
+    scrub(title)
+    t = api("POST", f"/channels/{ch['id']}/threads", {
+        "name": title, "type": 11, "auto_archive_duration": 10080})
+    m = _say(peer, t["id"], " ".join(rest[1:]))
+    _hold(t["id"], opts)
+    print(f"created thread {t['id']} '{title}', posted message {m['id']}")
+
+
+def cmd_peer_wait(args):
+    """peer-wait --to <thread id> (--until REGEX [--hours H] | --hours H
+    | --off) -- set or clear a hold without posting."""
+    peer, ch, opts, _ = _peer(args)
+    if not (opts["until"] or opts["hours"] or opts["off"]):
+        raise SystemExit("usage: peer-wait --to <id> --until REGEX | "
+                         "--hours H | --off")
+    _hold(ch["id"], opts)
 
 
 def cmd_peer_read(args):
-    """peer-read [--to <channel_id>] [n] -- the peer channel's last n
-    messages (default 15), newest last."""
-    peer, cid, rest = _peer(args)
+    """peer-read [--to <channel/thread id>] [n] -- its last n messages
+    (default 15), newest last."""
+    peer, ch, opts, rest = _peer(args)
+    cid = ch["id"]
     n = int(rest[0]) if rest and rest[0].isdigit() else 15
     msgs = api("GET", f"/channels/{cid}/messages?limit={min(n, 50)}")
     mark = uuid.uuid4().hex[:12]
@@ -581,7 +676,7 @@ def cmd_peer_read(args):
     print(f"<<<end of peer channel {mark}>>>")
 
 
-PEER_COMMANDS = {"peer-post", "peer-read"}
+PEER_COMMANDS = {"peer-post", "peer-read", "peer-thread", "peer-wait"}
 
 # Lookups (a server's channel and active-thread names and ids, never
 # message content): an owner command's nonce, or an owner DM's (a
@@ -603,6 +698,8 @@ COMMANDS = {
     "delete-own": (cmd_delete_own, 2),
     "peer-post": (cmd_peer_post, 1),
     "peer-read": (cmd_peer_read, 0),
+    "peer-thread": (cmd_peer_thread, 2),
+    "peer-wait": (cmd_peer_wait, 1),
 }
 
 

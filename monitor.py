@@ -322,13 +322,45 @@ def _who(msg):
 # Bridge fork (BRIDGE.md): another agent the owner pairs this bot with,
 # in its own channels (config.yaml peers:). Read at start.
 PEERS = _S0.peers
+PEER_HOLDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "peer_holds.json")
 
 
 def peer_of(msg):
-    """The peer that wrote msg in one of its channels (verified id)."""
+    """The peer that wrote msg in one of its channels, or a thread of
+    one (verified id)."""
     uid, cid = str(_who(msg).get("id")), str(msg.get("channel_id"))
-    return next((p for p in PEERS
-                 if p["user_id"] == uid and cid in p["channels"]), None)
+    parent = str((CHANNELS.get(cid) or {}).get("parent_id") or "")
+    return next((p for p in PEERS if p["user_id"] == uid
+                 and (cid in p["channels"] or parent in p["channels"])),
+                None)
+
+
+def peer_held(msg):
+    """True when the worker asked not to be woken in this channel yet
+    (bin/discord-api.py --until/--hours, peer_holds.json) and msg does
+    not meet the condition, which then ends the hold. Only the peer is
+    ever held (its replies often @mention or reply to the bot, so those
+    don't count); the hold lapses at its expiry."""
+    try:
+        with open(PEER_HOLDS_FILE) as f:
+            holds = json.load(f)
+        hold = holds.get(str(msg.get("channel_id")))
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(hold, dict) or time.time() > hold.get("expires", 0):
+        return False
+    until = hold.get("until")
+    try:
+        met = bool(until) and re.search(until, msg.get("content") or "",
+                                        re.I)
+    except re.error:
+        met = True
+    if met:
+        holds.pop(str(msg.get("channel_id")), None)
+        atomic_write(PEER_HOLDS_FILE, holds)
+        return False
+    return True
 
 
 def is_bot_author(author):
@@ -4110,8 +4142,11 @@ def trigger_verdict(msg, guild_id=None, state=None):
     if not owner and owners_absent(gid):
         return None, ("none of the owners is in this server"
                       if direct else None)
-    if peer_of(msg):
-        return "mention", None  # a peer in its channel: always addressed
+    if peer_of(msg):  # a peer in its channels: addressed, unless held
+        # A held message is ledgered skipped (the refusal), so the
+        # sweep never requeues it after the hold ends; the next wake
+        # still sees it in history.
+        return (None, "peer hold") if peer_held(msg) else ("mention", None)
     if is_bot_author(author) and here["who.bots"] == "ignore":
         return None, "who.bots: ignore" if direct else None
     if not direct and not (state is not None

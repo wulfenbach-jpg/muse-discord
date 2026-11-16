@@ -37,21 +37,41 @@ m.owners_absent = lambda gid: False
 st = {"last_seen": {}, "replied_to": [], "history": {},
       "rate": {"day": "", "day_count": 0, "users": {}},
       "guild_joined": {"G": 0}}
+m.LEDGER_FILE = os.path.join(os.environ["TMPD"], "ledger.json")
+m.PEER_HOLDS_FILE = os.path.join(os.environ["TMPD"], "holds.json")
+SUB = "1200000000000000009"   # a thread under the peer's channel
+m.CHANNELS[SUB] = {"name": "task", "guild_id": "G", "thread": True,
+                   "parent_id": sys.argv_thread}
 n = [0]
-def msg(author, channel, bot=True):
+def msg(author, channel, bot=True, text="done: report attached"):
     n[0] += 1
     return {"id": str(1300000000000000000 + n[0]), "channel_id": channel,
             "guild_id": "G", "type": 0,
             "author": {"id": author, "username": "a", "bot": bot},
-            "content": "done: report attached",
+            "content": text,
             "timestamp": "2026-11-15T00:00:00+00:00", "mentions": []}
 out = {}
 with contextlib.redirect_stdout(io.StringIO()):
     for name, a, c in [("peer_in_thread", sys.argv_peer, sys.argv_thread),
+                       ("peer_in_subthread", sys.argv_peer, SUB),
                        ("peer_elsewhere", sys.argv_peer, "101"),
                        ("other_bot_in_thread", "1200000000000000003",
                         sys.argv_thread)]:
         out[name] = m.classify_message(st, msg(a, c), "S #t", "G")
+    import time
+    with open(m.PEER_HOLDS_FILE, "w") as f:
+        json.dump({SUB: {"until": "^(DONE|BLOCKED)",
+                         "expires": time.time() + 60}}, f)
+    out["held_ack"] = m.classify_message(
+        st, msg(sys.argv_peer, SUB, text="on it, working"), "S #t", "G")
+    out["owner_in_held"] = m.classify_message(
+        st, dict(msg("111", SUB, bot=False, text="status?"),
+                 mentions=[{"id": "999"}]), "S #t", "G")
+    out["held_done"] = m.classify_message(
+        st, msg(sys.argv_peer, SUB, text="DONE: shipped"), "S #t", "G")
+    out["after_hold"] = m.classify_message(
+        st, msg(sys.argv_peer, SUB, text="also, fyi"), "S #t", "G")
+    out["ledger_has_hold"] = "peer hold" in open(m.LEDGER_FILE).read()
 out["peers"] = [p["name"] for p in m.PEERS]
 print(json.dumps(out))
 """
@@ -88,8 +108,17 @@ class Peers(unittest.TestCase):
         r = run_probe(CFG)
         self.assertEqual(r["peers"], ["hermes"])
         self.assertEqual(r["peer_in_thread"], "mention")
+        self.assertEqual(r["peer_in_subthread"], "mention")
         self.assertIsNone(r["peer_elsewhere"])
         self.assertIsNone(r["other_bot_in_thread"])
+
+    def test_hold(self):
+        r = run_probe(CFG)
+        self.assertIsNone(r["held_ack"])           # held: no wake
+        self.assertEqual(r["owner_in_held"], "mention")  # owner never held
+        self.assertEqual(r["held_done"], "mention")  # condition met
+        self.assertEqual(r["after_hold"], "mention")  # hold ended
+        self.assertTrue(r["ledger_has_hold"])      # sweep won't requeue
 
     def test_validate(self):
         self.assertEqual(validate(CFG).returncode, 0, validate(CFG).stdout)
