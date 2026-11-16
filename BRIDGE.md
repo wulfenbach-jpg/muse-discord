@@ -35,7 +35,9 @@ human writes in the thread.
 cd ~/workspace/muse-discord
 git remote rename origin upstream
 git remote add origin https://github.com/<you>/muse-discord.git
+git stash -u            # local edits (e.g. a blanked telemetry URL): the branch has them
 git fetch origin && git checkout -B bridge origin/bridge
+python3 bin/render-worker-prompt.py --media <same as before>   # adds PEER AGENT
 ```
 
 Add to `config.yaml` (ids are the peer's user id and the shared thread):
@@ -53,9 +55,6 @@ bash watchdog.sh            # restart the monitor: peers are read at start
 .venv/bin/python3 bin/discord-api.py peer-post "ping from the bridge"
 .venv/bin/python3 bin/discord-api.py peer-read 5
 ```
-
-Then re-render the worker prompt the way SETUP.md does, so the worker
-picks up the PEER AGENT section.
 
 The peer's side has to wake on this bot's messages: allowlist this bot,
 and it must answer bots. `peer-post` @mentions the peer every time.
