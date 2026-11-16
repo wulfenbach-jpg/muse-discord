@@ -1168,6 +1168,7 @@ class Settings:
         self.respond_to = {"mention", "reply_to_bot"}
         self.engine = {}
         self.owners = []
+        self.peers = []           # bridge fork: parse_peers, BRIDGE.md
         self.persona = DEFAULT_PERSONA
         self.token_from = DEFAULT_TOKEN_FILE
         self.legacy_defaults = False
@@ -1773,15 +1774,49 @@ def load(config_path, plugins_dir=None, overlay_path=None,
     return st
 
 
+_PEER_ID = re.compile(r"[1-9][0-9]{16,19}")
+
+
+def parse_peers(raw):
+    """Bridge fork (BRIDGE.md): config.yaml's peers: -> ([{user_id, name,
+    channels}], [(where, error)]). A peer's every message in its
+    channels wakes the bot; bin/discord-api.py peer-post talks to it."""
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [("peers", "expected a list")]
+    out, errs = [], []
+    for i, e in enumerate(raw):
+        e = e if isinstance(e, dict) else {}
+        uid = str(e.get("user_id") or "")
+        chans = [str(c) for c in e.get("channels") or []]
+        extra = set(e) - {"user_id", "name", "channels"}
+        if extra:
+            errs.append((f"peers[{i}]", f"unknown key {sorted(extra)[0]!r};"
+                         f" valid: user_id, name, channels"))
+        elif not _PEER_ID.fullmatch(uid):
+            errs.append((f"peers[{i}].user_id", "expected a Discord user id"))
+        elif not chans or not all(_PEER_ID.fullmatch(c) for c in chans):
+            errs.append((f"peers[{i}].channels",
+                         "expected a list of channel/thread ids"))
+        else:
+            out.append({"user_id": uid, "channels": chans,
+                        "name": str(e.get("name") or uid)[:32]})
+    return out, errs
+
+
 def _parse_new(p, data, aliases, st):
     allowed = {"version", "owners", "persona", "token_from", "presence",
                "updates", "telemetry", "memory", "everywhere", "dms",
                "all_servers",
-               "servers", "engine", "testing"}
+               "servers", "engine", "testing", "peers"}
     for k in data:
         if k not in allowed:
             p.err(str(k), "unknown top-level key; valid: "
                   + ", ".join(sorted(allowed - {"testing"})))
+    st.peers, errs = parse_peers(data.get("peers"))
+    for where, msg in errs:
+        p.err(where, msg)
     v = data.get("version")
     if v is not None and v != 1:
         p.err("version", f"{v!r} is not supported; valid: 1")
@@ -2602,7 +2637,7 @@ def build_migrated(config_path, plugins_dir=None, state_path=None):
     order = ["version", "owners", "persona", "token_from", "presence",
              "updates", "telemetry", "memory", "everywhere", "dms",
              "all_servers",
-             "servers", "engine", "testing"]
+             "servers", "engine", "testing", "peers"]
     data["version"] = 1
     out = {k: data[k] for k in order if k in data}
     header = ("# muse-discord settings (converted from the old layout by "

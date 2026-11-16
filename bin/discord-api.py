@@ -519,6 +519,70 @@ def cmd_delete_own(args):
     print(f"deleted {mid}")
 
 
+# Bridge fork (BRIDGE.md): peer-post and peer-read act only in
+# a peer's own channels (config.yaml peers:), with no owner nonce, so the
+# main chat and any run can talk to the peer. Every other subcommand
+# keeps its nonce rule.
+def _peer(args):
+    """(peer, channel_id, rest) from [--to <channel_id>] ARGS: the peer
+    whose channels hold --to, else the first peer's first channel."""
+    st = _settings()
+    peers = st.peers if st is not None else []
+    to = None
+    if len(args) >= 2 and args[0] == "--to":
+        to, args = snowflake(args[1]), args[2:]
+    for p in peers:
+        if to is None or to in p["channels"]:
+            return p, to or p["channels"][0], args
+    raise SystemExit("Refusing: no peer in config.yaml has that channel.")
+
+
+def _open_peer_channel(cid):
+    """Refuse DMs; un-archive an archived (unlocked) thread first."""
+    ch = api("GET", f"/channels/{cid}")
+    if ch.get("type") in DM_TYPES:
+        raise SystemExit(f"Refusing: {cid} is a DM.")
+    meta = ch.get("thread_metadata") or {}
+    if meta.get("archived") and not meta.get("locked"):
+        api("PATCH", f"/channels/{cid}", {"archived": False})
+
+
+def cmd_peer_post(args):
+    """peer-post [--to <channel_id>] <text> -- message the peer agent in
+    its channel; @mentions the peer and nobody else."""
+    peer, cid, rest = _peer(args)
+    tag = f"<@{peer['user_id']}>"
+    text = " ".join(rest).strip()
+    text = text if tag in text else f"{tag} {text}"
+    if len(text) > 2000:
+        raise SystemExit(f"Refusing: {len(text)} characters; Discord "
+                         f"takes 2000. Split it.")
+    scrub(text)
+    _open_peer_channel(cid)
+    m = api("POST", f"/channels/{cid}/messages", {
+        "content": text,
+        "allowed_mentions": {"users": [peer["user_id"]]}})
+    print(f"posted message {m['id']} to {peer['name']}")
+
+
+def cmd_peer_read(args):
+    """peer-read [--to <channel_id>] [n] -- the peer channel's last n
+    messages (default 15), newest last."""
+    peer, cid, rest = _peer(args)
+    n = int(rest[0]) if rest and rest[0].isdigit() else 15
+    msgs = api("GET", f"/channels/{cid}/messages?limit={min(n, 50)}")
+    mark = uuid.uuid4().hex[:12]
+    print(f"<<<peer channel {mark}>>>")
+    for m in reversed(msgs):
+        a = m.get("author") or {}
+        tag = "[peer] " if str(a.get("id")) == peer["user_id"] else ""
+        print(f"{m['id']}  {tag}{_flat(a.get('username', '?'), mark)}: "
+              f"{_flat((m.get('content') or '')[:1500], mark)}")
+    print(f"<<<end of peer channel {mark}>>>")
+
+
+PEER_COMMANDS = {"peer-post", "peer-read"}
+
 # Lookups (a server's channel and active-thread names and ids, never
 # message content): an owner command's nonce, or an owner DM's (a
 # settings request names places). Every other subcommand needs an owner
@@ -537,6 +601,8 @@ COMMANDS = {
     "pin": (cmd_pin, 2),
     "unpin": (cmd_unpin, 2),
     "delete-own": (cmd_delete_own, 2),
+    "peer-post": (cmd_peer_post, 1),
+    "peer-read": (cmd_peer_read, 0),
 }
 
 
@@ -562,7 +628,8 @@ def main(argv):
         print(fn.__doc__.strip(), file=sys.stderr)
         return 2
     BINDING["cmd"] = args[0]
-    require_owner_command(lookup=args[0] in LOOKUPS)
+    if args[0] not in PEER_COMMANDS:
+        require_owner_command(lookup=args[0] in LOOKUPS)
     fn(args[1:])
     return 0
 

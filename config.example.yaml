@@ -27,6 +27,12 @@ token_from: ~/.config/muse-discord/bot_token
                           # env:NAME for an environment variable. Never
                           # put the token itself in this file.
 
+# --- Bridge fork: a peer agent (BRIDGE.md) --------------------------
+# peers:                  # its every message there wakes the bot;
+#   - user_id: "..."      # bin/discord-api.py peer-post talks to it.
+#     name: hermes        # Restart the monitor after editing.
+#     channels: ["..."]   # the channel/thread ids they share
+
 # --- The bot itself -----------------------------------------------
 presence:
   status: ""              # a line shown under the bot's name; "" = none

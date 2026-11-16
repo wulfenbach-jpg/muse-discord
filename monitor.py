@@ -319,6 +319,18 @@ def _who(msg):
     return msg.get("author") or {}
 
 
+# Bridge fork (BRIDGE.md): another agent the owner pairs this bot with,
+# in its own channels (config.yaml peers:). Read at start.
+PEERS = _S0.peers
+
+
+def peer_of(msg):
+    """The peer that wrote msg in one of its channels (verified id)."""
+    uid, cid = str(_who(msg).get("id")), str(msg.get("channel_id"))
+    return next((p for p in PEERS
+                 if p["user_id"] == uid and cid in p["channels"]), None)
+
+
 def is_bot_author(author):
     """True when a message author is a bot (Discord's author.bot), unless
     testing.treat_as_human lists its id."""
@@ -4098,6 +4110,8 @@ def trigger_verdict(msg, guild_id=None, state=None):
     if not owner and owners_absent(gid):
         return None, ("none of the owners is in this server"
                       if direct else None)
+    if peer_of(msg):
+        return "mention", None  # a peer in its channel: always addressed
     if is_bot_author(author) and here["who.bots"] == "ignore":
         return None, "who.bots: ignore" if direct else None
     if not direct and not (state is not None
@@ -5518,7 +5532,7 @@ def classify_message(state, msg, channel_name, guild_id=None):
         return None  # the bot's own messages: never triggers or fragments
     watch_scan(msg, guild_id)  # Discord watches (cheap; never raises)
     TM.count("messages_seen")
-    if is_bot_author(author) and settings().get(
+    if is_bot_author(author) and not peer_of(msg) and settings().get(
             "who.bots", scope_for(guild_id, msg.get("channel_id"))) \
             == "ignore":
         if addresses_bot(msg):
@@ -5965,6 +5979,9 @@ def enqueue_message(msg, cname, state, queue, dm=False, fragments=None,
                                   msg["channel_id"], exchange),
     }
     item.update(extra)
+    if peer_of(msg):
+        item["peer"] = {"name": peer_of(msg)["name"],  # bridge fork
+                        "owners": sorted(OWNER_USER_IDS)}
     # Reminders and watches: the author's own list, and whether they may
     # set one here (abilities.reminders).
     item["watches"] = watch_card(author_id, guild_id, dm, from_bot, here,

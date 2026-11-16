@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 SCHEMA = 1
 # The maintainer's Worker (telemetry/worker). Empty = nothing is ever
 # sent (counts are still kept locally).
-TELEMETRY_URL = "https://muse-telemetry.clono.workers.dev"
+TELEMETRY_URL = ""  # bridge fork: telemetry never leaves this machine
 REPORT_PATH = "/v1/report"
 ENV_SWITCH = "MUSE_DISCORD_TELEMETRY"       # "off" turns it off
 ENV_URL = "MUSE_DISCORD_TELEMETRY_URL"      # overrides TELEMETRY_URL
