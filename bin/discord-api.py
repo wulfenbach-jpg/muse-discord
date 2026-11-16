@@ -536,10 +536,11 @@ def _peer(args):
     if not peers:
         raise SystemExit("Refusing: no peers in config.yaml.")
     opts, rest, i = {"to": None, "until": None, "hours": None, "from": None,
+                     "report": None, "ack": None,
                      "off": False, "solo": False}, [], 0
     while i < len(args):
         a = args[i]
-        if a in ("--to", "--until", "--hours", "--from") \
+        if a in ("--to", "--until", "--hours", "--from", "--report", "--ack") \
                 and i + 1 < len(args):
             opts[a[2:]] = args[i + 1]
             i += 2
@@ -567,26 +568,29 @@ def _wake_ok(ch):
         api("PATCH", f"/channels/{ch['id']}", {"archived": False})
 
 
-def _hold(cid, opts):
-    """peer_holds.json: don't wake the worker for the peer's messages in
-    cid until one matches --until (case-insensitive regex) or --hours
-    pass (default 24, max 168); the owner and others are never held.
-    --off clears. Nothing to do without --until/--hours/--off."""
-    if not (opts["until"] or opts["hours"] or opts["off"]):
-        return
-    try:
-        with open(PEER_HOLDS_FILE) as f:
-            holds = json.load(f)
-        holds = holds if isinstance(holds, dict) else {}
-    except (OSError, ValueError):
-        holds = {}
+def _hold(cid, opts, order=None):
+    """peer_holds.json (the monitor acts on it): don't wake the worker
+    for the peer's messages in cid until one matches --until
+    (case-insensitive regex) or --hours pass (default 24, max 168); the
+    owner and others are never held. --report main: the match goes to
+    the main chat (relay) instead of waking the worker. --ack M: no
+    word at all from the peer within M minutes is reported to the main
+    chat at once (its machine is likely off); so is a hold that runs
+    out. --off clears. order: (message id, text) of the post it
+    follows. Nothing to do without --until/--hours/--ack/--off."""
     import time
-    holds = {k: v for k, v in holds.items()
-             if isinstance(v, dict) and v.get("expires", 0) > time.time()}
-    if opts["off"]:
-        holds.pop(cid, None)
-        print(f"hold on {cid} cleared")
-    else:
+    if not (opts["until"] or opts["hours"] or opts["ack"] or opts["off"]):
+        if opts["report"]:
+            raise SystemExit("Refusing: --report needs --until, --hours or "
+                             "--ack.")
+        return
+    if opts["report"] not in (None, "main"):
+        raise SystemExit("Refusing: --report takes only 'main'.")
+    with _locked_json(PEER_HOLDS_FILE) as holds:
+        if opts["off"]:
+            holds.pop(cid, None)
+            print(f"hold on {cid} cleared")
+            return
         until = opts["until"]
         if until:
             if len(until) > 200:
@@ -597,16 +601,24 @@ def _hold(cid, opts):
                 raise SystemExit(f"Refusing: --until is not a regex ({e}).")
         try:
             hours = min(max(float(opts["hours"] or 24), 0.01), 168)
+            ack = min(max(float(opts["ack"]), 1), 1440) if opts["ack"] \
+                else None
         except ValueError:
-            raise SystemExit("Refusing: --hours is not a number.")
-        holds[cid] = {"until": until, "expires": time.time() + hours * 3600}
-        why = f"a message matches {until!r} or " if until else ""
-        print(f"peer messages in {cid} won't wake you until {why}"
-              f"{hours:g}h pass")
-    tmp = f"{PEER_HOLDS_FILE}.{uuid.uuid4().hex}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(holds, f)
-    os.replace(tmp, PEER_HOLDS_FILE)
+            raise SystemExit("Refusing: --hours / --ack is not a number.")
+        now = time.time()
+        since = order[0] if order else \
+            str((int(now * 1000) - 1420070400000) << 22)
+        holds[cid] = {"until": until, "expires": now + hours * 3600,
+                      "since": since,
+                      "report": opts["report"], "heard": False,
+                      "ack_by": now + ack * 60 if ack else None,
+                      "order_id": order[0] if order else None,
+                      "order": (order[1] if order else "")[:500]}
+    why = f"a message matches {until!r} or " if until else ""
+    to = "the main chat" if opts["report"] else "you"
+    print(f"peer messages in {cid} won't wake you until {why}{hours:g}h "
+          f"pass (the result goes to {to})"
+          + (f"; no word within {ack:g} min is reported" if ack else ""))
 
 
 def _say(peer, cid, text, solo=False):
@@ -632,7 +644,7 @@ def cmd_peer_post(args):
     peer, ch, opts, rest = _peer(args)
     _wake_ok(ch)
     m = _say(peer, ch["id"], " ".join(rest))
-    _hold(ch["id"], opts)
+    _hold(ch["id"], opts, (m["id"], " ".join(rest)))
     print(f"posted message {m['id']} to {peer['name']} in {ch['id']}")
 
 
@@ -659,7 +671,7 @@ def cmd_peer_thread(args):
     else:
         t = api("POST", f"/channels/{ch['id']}/threads", dict(body, type=11))
     m = _say(peer, t["id"], " ".join(rest[1:]), solo=opts["solo"])
-    _hold(t["id"], opts)
+    _hold(t["id"], opts, (m["id"], " ".join(rest[1:])))
     print(f"created thread {t['id']} '{title}', posted message {m['id']}")
 
 
@@ -667,9 +679,9 @@ def cmd_peer_wait(args):
     """peer-wait --to <thread id> (--until REGEX [--hours H] | --hours H
     | --off) -- set or clear a hold without posting."""
     peer, ch, opts, _ = _peer(args)
-    if not (opts["until"] or opts["hours"] or opts["off"]):
+    if not (opts["until"] or opts["hours"] or opts["ack"] or opts["off"]):
         raise SystemExit("usage: peer-wait --to <id> --until REGEX | "
-                         "--hours H | --off")
+                         "--hours H | --ack M | --off [--report main]")
     _hold(ch["id"], opts)
 
 
@@ -707,23 +719,29 @@ RELAY_LEASE_SECS = 1800
 
 
 @contextlib.contextmanager
-def _relay_locked():
-    """(requests dict) under an exclusive lock; written back on exit."""
+def _locked_json(path):
+    """A JSON dict file under an exclusive flock on <path>.lock (the
+    monitor's convention too), written back atomically, mode 600, when
+    the block ends without an exception."""
     import fcntl
-    with open(RELAY_FILE + ".lock", "a") as lock:
+    with open(path + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            with open(RELAY_FILE) as f:
-                reqs = json.load(f)
-            reqs = reqs if isinstance(reqs, dict) else {}
+            with open(path) as f:
+                data = json.load(f)
+            data = data if isinstance(data, dict) else {}
         except (OSError, ValueError):
-            reqs = {}
-        yield reqs
-        tmp = f"{RELAY_FILE}.{uuid.uuid4().hex}.tmp"
+            data = {}
+        yield data
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
         with open(tmp, "w") as f:
-            json.dump(reqs, f)
+            json.dump(data, f)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, RELAY_FILE)
+        os.replace(tmp, path)
+
+
+def _relay_locked():
+    return _locked_json(RELAY_FILE)
 
 
 def cmd_relay(args):
@@ -749,7 +767,7 @@ def cmd_relay(args):
     where = ch.get("guild_id") or "@me"
     scrub(note)
     with _relay_locked() as reqs:
-        reqs[mid] = {"id": mid, "channel_id": cid,
+        reqs[mid] = {"id": mid, "kind": "owner-request", "channel_id": cid,
                      "link": f"https://discord.com/channels/{where}/{cid}/"
                              f"{mid}",
                      "owner_words": (m.get("content") or "")[:1900],
@@ -771,9 +789,10 @@ def cmd_relay_pending(args):
             r["handed_at"] = now
     if due:
         print(json.dumps({
-            "requests": [{k: r.get(k) for k in
-                          ("id", "link", "owner_words", "worker_note")}
-                         for r in due],
+            "requests": [{k: r[k] for k in
+                          ("id", "kind", "link", "owner_words",
+                           "worker_note", "order", "peer_words")
+                          if r.get(k)} for r in due],
             "package_dir": PACKAGE_DIR,
             "done": f"python3 {PACKAGE_DIR}/bin/discord-api.py relay-done "
                     f"<id> \"<short answer for Discord>\""}))

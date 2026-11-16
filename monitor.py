@@ -336,31 +336,97 @@ def peer_of(msg):
                 None)
 
 
+RELAY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "main_requests.json")
+_HOLDS_TICK = {"at": 0.0}
+
+
+@contextlib.contextmanager
+def _locked_json(path):
+    """bin/discord-api.py's convention: a JSON dict under an exclusive
+    flock on <path>.lock, written back atomically (mode 600)."""
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            data = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            data = {}
+        yield data
+        atomic_write(path, data, mode=0o600)
+
+
+def relay_to_main(rid, kind, channel_id, guild_id, hold, peer_words=""):
+    """Queue a bridge outcome for the owner's main chat (main_requests.json,
+    hooks/main-relay.sh wakes it): the peer's result, or its silence."""
+    with _locked_json(RELAY_FILE) as reqs:
+        reqs[str(rid)] = {
+            "id": str(rid), "kind": kind, "channel_id": str(channel_id),
+            "link": f"https://discord.com/channels/{guild_id or '@me'}/"
+                    f"{channel_id}/{rid}",
+            "order": hold.get("order") or "",
+            "peer_words": (peer_words or "")[:1900],
+            "asked_at": int(time.time()), "handed_at": 0}
+    print(f"Relayed {kind} in {channel_id} to the main chat.", flush=True)
+
+
 def peer_held(msg):
-    """True when the worker asked not to be woken in this channel yet
-    (bin/discord-api.py --until/--hours, peer_holds.json) and msg does
-    not meet the condition, which then ends the hold. Only the peer is
-    ever held (its replies often @mention or reply to the bot, so those
-    don't count); the hold lapses at its expiry."""
+    """True when the worker asked not to be woken here yet (bin/
+    discord-api.py --until/--hours/--ack, peer_holds.json) and msg does
+    not meet the condition. A met condition ends the hold: it wakes the
+    worker, or, under --report main, goes to the main chat instead (also
+    True: the worker is not woken). Only the peer is ever held (its
+    replies often @mention or reply to the bot, so those don't count)."""
+    cid = str(msg.get("channel_id"))
+    with _locked_json(PEER_HOLDS_FILE) as holds:
+        hold = holds.get(cid)
+        if not isinstance(hold, dict) \
+                or time.time() > hold.get("expires", 0) \
+                or int(msg["id"]) <= int(hold.get("since") or 0):
+            return False  # (the sweep re-reads older messages too)
+        hold["heard"] = True  # the peer is up: no "never answered"
+        until = hold.get("until")
+        try:
+            met = bool(until) and re.search(
+                until, msg.get("content") or "", re.I)
+        except re.error:
+            met = True
+        if not met:
+            return True
+        holds.pop(cid, None)
+    if hold.get("report") == "main":
+        relay_to_main(msg["id"], "peer-result", cid, msg.get("guild_id"),
+                      hold, msg.get("content"))
+        return True
+    return False
+
+
+def peer_holds_tick():
+    """Every 20 s: a hold whose peer said nothing by its --ack deadline
+    ("peer-silent": likely its machine is off), or that ran out without
+    its condition ("peer-timeout"), goes to the main chat and ends.
+    Never raises."""
+    now = time.time()
+    if now - _HOLDS_TICK["at"] < 20 or not os.path.exists(PEER_HOLDS_FILE):
+        return
+    _HOLDS_TICK["at"] = now
     try:
-        with open(PEER_HOLDS_FILE) as f:
-            holds = json.load(f)
-        hold = holds.get(str(msg.get("channel_id")))
-    except (OSError, ValueError, AttributeError):
-        return False
-    if not isinstance(hold, dict) or time.time() > hold.get("expires", 0):
-        return False
-    until = hold.get("until")
-    try:
-        met = bool(until) and re.search(until, msg.get("content") or "",
-                                        re.I)
-    except re.error:
-        met = True
-    if met:
-        holds.pop(str(msg.get("channel_id")), None)
-        atomic_write(PEER_HOLDS_FILE, holds)
-        return False
-    return True
+        due = []
+        with _locked_json(PEER_HOLDS_FILE) as holds:
+            for cid, h in list(holds.items()):
+                if not isinstance(h, dict):
+                    holds.pop(cid)
+                elif not h.get("heard") and h.get("ack_by") \
+                        and now > h["ack_by"]:
+                    due.append((cid, "peer-silent", holds.pop(cid)))
+                elif now > h.get("expires", 0):
+                    due.append((cid, "peer-timeout", holds.pop(cid)))
+        for cid, kind, h in due:
+            gid = (CHANNELS.get(cid) or {}).get("guild_id")
+            relay_to_main(h.get("order_id") or cid, kind, cid, gid, h)
+    except Exception as e:
+        print(f"Peer holds tick error: {e}", flush=True)
 
 
 def is_bot_author(author):
@@ -4148,9 +4214,9 @@ def trigger_verdict(msg, guild_id=None, state=None):
             and not addresses_someone_else(msg):
         return "mention", None  # an owner in a thread the bot opened
     if peer_of(msg):  # a peer in its channels: addressed, unless held
-        # A held message is ledgered skipped (the refusal), so the
-        # sweep never requeues it after the hold ends; the next wake
-        # still sees it in history.
+        # A held message (or a result relayed to the main chat) is
+        # ledgered skipped, so the sweep never requeues it; the next
+        # wake still sees it in history.
         return (None, "peer hold") if peer_held(msg) else ("mention", None)
     if is_bot_author(author) and here["who.bots"] == "ignore":
         return None, "who.bots: ignore" if direct else None
@@ -8946,6 +9012,8 @@ def main():
             PRO.tick(state)  # the heartbeat: reaching out on its own
         except Exception as e:
             print(f"Proactive error: {e}", flush=True)
+
+        peer_holds_tick()  # bridge: silent peers, holds run out
 
         # One REST slice per tick (see "Sliced REST work"): the poll's,
         # or the background job's, alternating when both are due.

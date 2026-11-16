@@ -112,6 +112,21 @@ class PeerApi(unittest.TestCase):
         _, err = run(mod, "peer-wait", "--to", SUB, "--until", "(")
         self.assertIn("not a regex", err)
 
+    def test_report_main_with_ack(self):
+        mod, _ = load()
+        out, err = run(mod, "peer-thread", "--report", "main", "--ack", "10",
+                       "--until", "^(DONE|FAILED)", "Add tasks",
+                       "add these; reply ACK, then DONE or FAILED")
+        self.assertIsNone(err, out)
+        h = json.load(open(mod.PEER_HOLDS_FILE))["1200000000000000055"]
+        self.assertEqual((h["report"], h["heard"], h["order_id"],
+                          h["since"]), ("main", False, "1300000000000000001",
+                                        "1300000000000000001"))
+        self.assertTrue(h["ack_by"] and h["order"].startswith("add these"))
+        _, err = run(mod, "peer-wait", "--to", SUB, "--report", "worker",
+                     "--hours", "1")
+        self.assertIn("only 'main'", err)
+
     def test_solo_thread_from_owner_message(self):
         mod, calls = load()
         out, err = run(mod, "peer-thread", "--from", "1300000000000000042",

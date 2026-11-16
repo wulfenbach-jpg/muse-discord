@@ -72,6 +72,39 @@ with contextlib.redirect_stdout(io.StringIO()):
     out["after_hold"] = m.classify_message(
         st, msg(sys.argv_peer, SUB, text="also, fyi"), "S #t", "G")
     out["ledger_has_hold"] = "peer hold" in open(m.LEDGER_FILE).read()
+    # Main-chat report: an older DONE is ignored, ACK keeps holding, the
+    # new DONE goes to main_requests.json and wakes no worker.
+    m.RELAY_FILE = os.path.join(os.environ["TMPD"], "main_requests.json")
+    old = msg(sys.argv_peer, SUB, text="DONE: last week's task")
+    order_id = str(int(old["id"]) + 1); n[0] += 1
+    with open(m.PEER_HOLDS_FILE, "w") as f:
+        json.dump({SUB: {"until": "^(DONE|FAILED)", "report": "main",
+                         "since": order_id, "order": "add 3 tasks",
+                         "order_id": order_id, "heard": False,
+                         "ack_by": time.time() + 600,
+                         "expires": time.time() + 3600}}, f)
+    out["sweep_old_done"] = m.trigger_kind(old, "G")
+    out["main_ack"] = m.classify_message(
+        st, msg(sys.argv_peer, SUB, text="ACK"), "S #t", "G")
+    out["main_done"] = m.classify_message(
+        st, msg(sys.argv_peer, SUB, text="DONE: 3 tasks added"), "S #t", "G")
+    rel = json.load(open(m.RELAY_FILE))
+    out["relayed"] = sorted((r["kind"], r["peer_words"], r["order"])
+                            for r in rel.values())
+    # Silence and timeout: the tick reports both to the main chat.
+    T1, T2 = "1200000000000000021", "1200000000000000022"
+    with open(m.PEER_HOLDS_FILE, "w") as f:
+        json.dump({T1: {"until": "^DONE", "heard": False,
+                        "ack_by": time.time() - 1, "order_id": "1300000000000009001",
+                        "expires": time.time() + 3600, "order": "o1"},
+                   T2: {"until": "^DONE", "heard": True, "ack_by": None,
+                        "order_id": "1300000000000009002",
+                        "expires": time.time() - 1, "order": "o2"}}, f)
+    m._HOLDS_TICK["at"] = 0
+    m.peer_holds_tick()
+    rel = json.load(open(m.RELAY_FILE))
+    out["tick_kinds"] = sorted(r["kind"] for r in rel.values())
+    out["holds_left"] = json.load(open(m.PEER_HOLDS_FILE))
     MINE, THEIRS = "1200000000000000010", "1200000000000000011"
     for tid, owner in ((MINE, "999"), (THEIRS, sys.argv_peer)):
         m.CHANNELS[tid] = {"name": "t", "guild_id": "G", "thread": True,
@@ -130,6 +163,17 @@ class Peers(unittest.TestCase):
         self.assertEqual(r["held_done"], "mention")  # condition met
         self.assertEqual(r["after_hold"], "mention")  # hold ended
         self.assertTrue(r["ledger_has_hold"])      # sweep won't requeue
+
+    def test_report_to_main(self):
+        r = run_probe(CFG)
+        self.assertEqual(r["sweep_old_done"], "mention")  # pre-hold: untouched
+        self.assertIsNone(r["main_ack"])
+        self.assertIsNone(r["main_done"])  # main chat, not the worker
+        self.assertIn(["peer-result", "DONE: 3 tasks added", "add 3 tasks"],
+                      r["relayed"])
+        self.assertEqual(r["tick_kinds"],
+                         ["peer-result", "peer-silent", "peer-timeout"])
+        self.assertEqual(r["holds_left"], {})
 
     def test_owner_in_bot_threads(self):
         r = run_probe(CFG)

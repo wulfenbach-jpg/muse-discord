@@ -64,3 +64,4 @@ __pycache__/
 
 # Cloudflare's wrangler CLI (telemetry/worker)
 .wrangler/
+playbook.md

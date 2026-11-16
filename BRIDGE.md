@@ -45,14 +45,33 @@ mentions, and `peer-post --to <thread>` brings the peer in.
 ## From the main chat
 
 The owner's Muse main chat (the native UI) is not the reply worker and
-never reads its prompt. It uses the same commands from the package dir:
-`peer-thread "<title>" "<task>"` to start a task with the peer (add
-`--solo` for a thread with just the owner), `peer-post --to <thread>`
-to continue, and `peer-read --to <thread>` to check on it. Anything
-posted in a thread the bot opened, by the peer or the owner, then wakes
-the reply worker, which carries the thread on. Put a line about this in
-the Muse's own notes or memory so the main chat knows the commands
-exist.
+never reads its prompt. It uses the same commands from the package dir,
+and gets the outcome back itself:
+
+```bash
+$api peer-thread --report main --ack 10 --until '^(DONE|FAILED)' \
+  "Add tasks" "<order, per playbook.md>. Reply ACK now, then DONE: <what you did> or FAILED: <why>."
+```
+
+- `--report main`: the peer's DONE/FAILED message goes to the main chat
+  (through the relay hook), not the Discord worker.
+- `--ack 10`: no word at all from the peer within 10 minutes reaches the
+  main chat as `peer-silent`: its machine is most likely off.
+- The hold running out without a result comes as `peer-timeout`.
+
+The main chat tells the owner in place ("added to Super Productivity",
+or "your PC seems off; try again later?"), then `relay-done <id>`. Its
+own scheduler handles "try again tomorrow". Anything the owner posts in
+that thread still wakes the Discord worker. Put a line about all this in
+the Muse's notes or memory so the main chat knows the commands exist.
+
+## The playbook
+
+`playbook.md` in the package dir (untracked, the owner's) is what both
+sessions read before ordering the peer: the peer's tools (MCP servers
+on its machine), how to word orders for each, the style and tags to
+use, and the reply format. Without it, orders are only as precise as
+the bot's memory.
 
 ## The relay (Discord -> main chat)
 
@@ -74,12 +93,18 @@ of thing in Discord, the worker relays it:
 Register the hook in Muse like `update-watch.sh` (SETUP.md step 5):
 60 s, delivered to the **main chat**, with this wake prompt:
 
-> The owner asked you something from Discord; the payload has their
-> exact words (`owner_words`: their instruction) and the Discord
-> worker's context (`worker_note`). Do it here with your full tools and
-> memory, saving to memory anything worth keeping from the context. Then
-> run the payload's `done` command for each request with a short answer
-> for Discord.
+> muse-discord relayed something to you; act on each request by its
+> `kind`. `owner-request`: the owner asked from Discord; `owner_words`
+> are their exact instruction, `worker_note` the Discord side's context.
+> Do it here with your full tools and memory (save what's worth
+> keeping), then run the `done` command with a short answer for
+> Discord. `peer-result`: the peer's reply (`peer_words`) to the order
+> you gave (`order`); check it and tell the owner here whether it
+> worked. `peer-silent`: the peer never answered, so its machine is
+> probably off; tell the owner and offer to retry later.
+> `peer-timeout`: it answered but never finished; tell the owner. For
+> the peer kinds, run the `done` command with no answer to close it
+> (with an answer only if the owner should see it in Discord).
 
 ## Cost
 
