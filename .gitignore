@@ -45,6 +45,8 @@ web_watch_results.json
 web_nonces.json
 telemetry.json
 peer_holds.json
+main_requests.json
+main_requests.json.lock
 telemetry_id
 telemetry.wakes
 telemetry.wakes.taking

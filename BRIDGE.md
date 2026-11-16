@@ -14,6 +14,7 @@ owner can read along or jump into any thread.
 | Own threads | `monitor.py` `trigger_verdict` | An owner's messages in a thread the bot opened wake it with no mention, like Hermes's threads (unless the message is addressed to someone else). Pinged in the peer's channel itself, the worker answers in a new thread on the owner's message. |
 | Holds | `monitor.py` `peer_held`, `peer_holds.json` | The worker can stay asleep in a thread until the peer's message matches a regex, or until some hours pass. Held messages are recorded as handled (the sweep never requeues them), and the next wake sees them in its history. Only the peer is held, never the owner. |
 | Outbound | `bin/discord-api.py peer-*` | `peer-thread` (new thread, first message), `peer-post`, `peer-read` and `peer-wait`, with no owner nonce, from the main chat or any run, only in the peer's channels and their threads. They @mention only the peer and un-archive threads when needed. |
+| Relay | `bin/discord-api.py relay` / `relay-pending` / `relay-done`, `hooks/main-relay.sh` | The reply worker hands an owner's Discord request it can't do (cron, shell, files, memory) to the Muse's main chat, which does it with full tools and answers back in Discord. Only an owner's own message, checked by its nonce and re-read from Discord. |
 | Orders | `worker-prompt.template.md`, PEER AGENT | Chain of command: owner -> this bot -> peer, and peer -> this bot. What the owner tells this bot to have the peer do counts as the owner's say-so. |
 | Config | `peers:` in `config.yaml`, `muse_settings.parse_peers` | Validated by `bin/settings.py validate`. |
 | Telemetry | `telemetry.py` | `TELEMETRY_URL = ""`: nothing is ever sent. |
@@ -52,6 +53,33 @@ posted in a thread the bot opened, by the peer or the owner, then wakes
 the reply worker, which carries the thread on. Put a line about this in
 the Muse's own notes or memory so the main chat knows the commands
 exist.
+
+## The relay (Discord -> main chat)
+
+The reply worker is a separate, deliberately limited session: it
+doesn't use the shell, schedule jobs or write memory, and the main
+chat never sees its conversations. When the owner asks for that kind
+of thing in Discord, the worker relays it:
+
+1. Worker: `discord-api.py --for <msg> --nonce <owner nonce> relay
+   <channel> "<what + context>"`. The tool checks the nonce, re-reads
+   the message from Discord, refuses anything not written by an owner,
+   and records the owner's exact words in `main_requests.json`.
+2. `hooks/main-relay.sh` (60 s) wakes the main chat with the request. A
+   request still open after 30 minutes is handed out again.
+3. Main chat: does it with full tools and memory, then `discord-api.py
+   relay-done <id> "<answer>"`, which replies to the owner's message in
+   Discord (`relay-done <id>` alone just closes it).
+
+Register the hook in Muse like `update-watch.sh` (SETUP.md step 5):
+60 s, delivered to the **main chat**, with this wake prompt:
+
+> The owner asked you something from Discord; the payload has their
+> exact words (`owner_words`: their instruction) and the Discord
+> worker's context (`worker_note`). Do it here with your full tools and
+> memory, saving to memory anything worth keeping from the context. Then
+> run the payload's `done` command for each request with a short answer
+> for Discord.
 
 ## Cost
 

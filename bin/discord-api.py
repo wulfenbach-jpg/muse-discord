@@ -57,6 +57,7 @@ MUSE_DISCORD_CONFIG), read through muse_settings.py so both config
 layouts work (old layout: the bot.token_env env var first, then
 bot.token_file, mode 600). The token is never printed.
 """
+import contextlib
 import hmac
 import json
 import mimetypes
@@ -689,7 +690,122 @@ def cmd_peer_read(args):
     print(f"<<<end of peer channel {mark}>>>")
 
 
-PEER_COMMANDS = {"peer-post", "peer-read", "peer-thread", "peer-wait"}
+# ---------------------------------------------------------------------------
+# Bridge fork: the relay to the owner's main chat (BRIDGE.md). The reply
+# worker hands an owner's request it can't do from Discord (scheduled
+# jobs, the shell, files, memory) to the Muse's main chat, which has its
+# full tools and memory:
+#   worker:     --for <msg> --nonce <its owner nonce> relay <channel> <note>
+#   hook:       relay-pending  (hooks/main-relay.sh; prints the wake payload)
+#   main chat:  relay-done <msg> [<answer>]  (answers in Discord, closes)
+# Only an owner's own message can be relayed: its nonce (an owner
+# command's or an owner DM's) is checked, and its words are fetched from
+# Discord and verified as the owner's, never taken from the worker.
+# ---------------------------------------------------------------------------
+RELAY_FILE = os.path.join(PACKAGE_DIR, "main_requests.json")
+RELAY_LEASE_SECS = 1800
+
+
+@contextlib.contextmanager
+def _relay_locked():
+    """(requests dict) under an exclusive lock; written back on exit."""
+    import fcntl
+    with open(RELAY_FILE + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(RELAY_FILE) as f:
+                reqs = json.load(f)
+            reqs = reqs if isinstance(reqs, dict) else {}
+        except (OSError, ValueError):
+            reqs = {}
+        yield reqs
+        tmp = f"{RELAY_FILE}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(reqs, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, RELAY_FILE)
+
+
+def cmd_relay(args):
+    """--for <message_id> --nonce <its owner_command_nonce or
+    owner_dm_nonce> relay <channel_id> <note> -- hand the owner's request
+    to your main chat; note says what they want and any context."""
+    import time
+    cid, note = snowflake(args[0]), " ".join(args[1:]).strip()
+    mid, got = BINDING["for"], BINDING["nonce"]
+    if not mid or not got:
+        raise SystemExit("Refusing: relay needs --for <message_id> --nonce "
+                         "<its owner_command_nonce or owner_dm_nonce>.")
+    _for_id(mid)
+    if not (_matches(_live_nonce(mid, OWNER_ITEMS_FILE), got)
+            or _matches(_live_nonce(mid), got)):
+        raise SystemExit(f"Refusing: --nonce is not {mid}'s live owner "
+                         f"nonce.")
+    m = api("GET", f"/channels/{cid}/messages/{mid}")
+    owners = _owners() or set()
+    if str((m.get("author") or {}).get("id")) not in owners:
+        raise SystemExit("Refusing: that message is not an owner's.")
+    ch = api("GET", f"/channels/{cid}")
+    where = ch.get("guild_id") or "@me"
+    scrub(note)
+    with _relay_locked() as reqs:
+        reqs[mid] = {"id": mid, "channel_id": cid,
+                     "link": f"https://discord.com/channels/{where}/{cid}/"
+                             f"{mid}",
+                     "owner_words": (m.get("content") or "")[:1900],
+                     "worker_note": note[:1500],
+                     "asked_at": int(time.time()), "handed_at": 0}
+    print(f"relayed {mid} to the main chat")
+
+
+def cmd_relay_pending(args):
+    """relay-pending -- (hooks/main-relay.sh) the wake payload for the
+    relayed requests not handed out in the last 30 minutes, marked
+    handed; prints nothing when there are none."""
+    import time
+    now = int(time.time())
+    with _relay_locked() as reqs:
+        due = [r for r in reqs.values() if isinstance(r, dict)
+               and now - int(r.get("handed_at") or 0) >= RELAY_LEASE_SECS]
+        for r in due:
+            r["handed_at"] = now
+    if due:
+        print(json.dumps({
+            "requests": [{k: r.get(k) for k in
+                          ("id", "link", "owner_words", "worker_note")}
+                         for r in due],
+            "package_dir": PACKAGE_DIR,
+            "done": f"python3 {PACKAGE_DIR}/bin/discord-api.py relay-done "
+                    f"<id> \"<short answer for Discord>\""}))
+
+
+def cmd_relay_done(args):
+    """relay-done <id> [<answer>] -- close a relayed request; with an
+    answer, post it in Discord as a reply to the owner's message."""
+    rid = snowflake(args[0])
+    answer = " ".join(args[1:]).strip()
+    with _relay_locked() as reqs:
+        req = reqs.pop(rid, None)
+    if req is None:
+        raise SystemExit(f"No open relayed request {rid}.")
+    if answer:
+        if len(answer) > 2000:
+            raise SystemExit("Refusing: over 2000 characters; shorten it "
+                             "(the request is closed).")
+        scrub(answer)
+        m = api("POST", f"/channels/{req['channel_id']}/messages", {
+            "content": answer,
+            "allowed_mentions": {"users": sorted(_owners() or set())[:100],
+                                 "replied_user": True},
+            "message_reference": {"message_id": rid,
+                                  "fail_if_not_exists": False}})
+        print(f"answered in Discord: message {m['id']}")
+    print(f"closed {rid}")
+
+
+SELF_CHECKED = {  # bridge: each checks its own access
+    "peer-post", "peer-read", "peer-thread", "peer-wait",
+    "relay", "relay-pending", "relay-done"}
 
 # Lookups (a server's channel and active-thread names and ids, never
 # message content): an owner command's nonce, or an owner DM's (a
@@ -713,6 +829,9 @@ COMMANDS = {
     "peer-read": (cmd_peer_read, 0),
     "peer-thread": (cmd_peer_thread, 2),
     "peer-wait": (cmd_peer_wait, 1),
+    "relay": (cmd_relay, 2),
+    "relay-pending": (cmd_relay_pending, 0),
+    "relay-done": (cmd_relay_done, 1),
 }
 
 
@@ -738,7 +857,7 @@ def main(argv):
         print(fn.__doc__.strip(), file=sys.stderr)
         return 2
     BINDING["cmd"] = args[0]
-    if args[0] not in PEER_COMMANDS:
+    if args[0] not in SELF_CHECKED:
         require_owner_command(lookup=args[0] in LOOKUPS)
     fn(args[1:])
     return 0
